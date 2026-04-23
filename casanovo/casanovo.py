@@ -35,6 +35,7 @@ import appdirs
 import github
 import requests
 import rich_click as click
+import torch
 import tqdm
 from lightning.pytorch import seed_everything
 
@@ -63,7 +64,7 @@ class _SharedFileIOParams(click.RichCommand):
             click.Option(
                 ("-o", "--output_root"),
                 help="The root name for all output files.",
-                type=click.Path(dir_okay=False),
+                type=str,
             ),
             click.Option(
                 ("-f", "--force_overwrite"),
@@ -151,11 +152,18 @@ def main() -> None:
     is_flag=True,
     default=False,
     help="""
-    Run in evaluation mode. When this flag is set the peptide and amino acid  
-    precision will be calculated and logged at the end of the sequencing run. 
-    All input files must be annotated MGF files if running in evaluation 
+    Run in evaluation mode. When this flag is set the peptide and amino acid
+    precision will be calculated and logged at the end of the sequencing run.
+    All input files must be annotated MGF files if running in evaluation
     mode.
     """,
+)
+@click.option(
+    "--profile",
+    "profile_output",
+    default=None,
+    type=click.Path(dir_okay=False, writable=True),
+    help="Write a PyTorch Profiler Chrome trace to this path after inference.",
 )
 def sequence(
     peak_path: Tuple[str],
@@ -166,6 +174,7 @@ def sequence(
     verbosity: str,
     force_overwrite: bool,
     evaluate: bool,
+    profile_output: Optional[str],
 ) -> None:
     """De novo sequence peptides from tandem mass spectra.
 
@@ -180,7 +189,9 @@ def sequence(
     start_time = time.time()
     utils.log_system_info()
 
-    utils.check_dir_file_exists(output_path, f"{output_root}.mztab")
+    if not force_overwrite:
+        utils.check_dir_file_exists(output_path, f"{output_root_name}.mztab")
+
     config, model = setup_model(
         model, config, output_path, output_root_name, False
     )
@@ -200,9 +211,17 @@ def sequence(
             logger.info("  %s", peak_file)
 
         results_path = output_path / f"{output_root_name}.mztab"
-        runner.predict(peak_path, str(results_path), evaluate=evaluate)
+        stage_times = runner.predict(
+            peak_path,
+            str(results_path),
+            evaluate=evaluate,
+            profile_output=profile_output,
+        )
         utils.log_annotate_report(
-            runner.writer.psms, start_time=start_time, end_time=time.time()
+            runner.writer.psms,
+            start_time=start_time,
+            end_time=time.time(),
+            stage_times=stage_times,
         )
 
 
@@ -219,6 +238,16 @@ def sequence(
     nargs=1,
     type=click.Path(exists=True, dir_okay=False),
 )
+@click.option(
+    "--export",
+    is_flag=True,
+    default=False,
+    help="""
+    Dumps peptides digested from data for debugging.
+    Contains mass of peptide, sequence, and proteins 
+    it is associated with
+    """,
+)
 def db_search(
     peak_path: Tuple[str],
     fasta_path: str,
@@ -226,6 +255,7 @@ def db_search(
     config: Optional[str],
     output_dir: Optional[str],
     output_root: Optional[str],
+    export: Optional[bool],
     verbosity: str,
     force_overwrite: bool,
 ) -> None:
@@ -241,7 +271,9 @@ def db_search(
     start_time = time.time()
     utils.log_system_info()
 
-    utils.check_dir_file_exists(output_path, f"{output_root}.mztab")
+    if not force_overwrite:
+        utils.check_dir_file_exists(output_path, f"{output_root_name}.mztab")
+
     config, model = setup_model(
         model, config, output_path, output_root_name, False
     )
@@ -262,6 +294,12 @@ def db_search(
 
         results_path = output_path / f"{output_root_name}.mztab"
         runner.db_search(peak_path, fasta_path, str(results_path))
+        if export:
+            if not force_overwrite:
+                utils.check_dir_file_exists(
+                    output_path, f"{output_root_name}.tsv"
+                )
+            runner.model.protein_database.export(output_path, output_root_name)
         utils.log_annotate_report(
             runner.writer.psms, start_time=start_time, end_time=time.time()
         )
@@ -285,6 +323,16 @@ def db_search(
     multiple=True,
     type=click.Path(exists=True, dir_okay=True),
 )
+@click.option(
+    "--load_all_states",
+    help="""
+    Flag to indicate whether all states are loaded when re-starting 
+    training, or only the weights. Defaults to False.
+    """,
+    required=False,
+    default=False,
+    is_flag=True,
+)
 def train(
     train_peak_path: Tuple[str],
     validation_peak_path: Optional[Tuple[str]],
@@ -294,6 +342,7 @@ def train(
     output_root: Optional[str],
     verbosity: str,
     force_overwrite: bool,
+    load_all_states: bool,
 ) -> None:
     """Train a Casanovo model on your own data.
 
@@ -301,6 +350,9 @@ def train(
     those provided by MassIVE-KB, from which to train a new Casnovo
     model.
     """
+
+    _is_valid_model(model, load_all_states)
+
     output_path, output_root_name = _setup_output(
         output_dir, output_root, force_overwrite, verbosity
     )
@@ -330,8 +382,139 @@ def train(
         for peak_file in validation_peak_path:
             logger.info("  %s", peak_file)
 
-        runner.train(train_peak_path, validation_peak_path)
+        runner.train(
+            train_peak_path,
+            validation_peak_path,
+            model if load_all_states else None,
+        )
+
         utils.log_run_report(start_time=start_time, end_time=time.time())
+
+
+@main.command(cls=_SharedParams)
+@click.argument(
+    "peak_path",
+    required=True,
+    nargs=-1,
+    type=click.Path(exists=True, dir_okay=True),
+)
+@click.option(
+    "--n_iter",
+    default=3,
+    show_default=True,
+    type=int,
+    help="Number of timed benchmark iterations (excluding warmup).",
+)
+@click.option(
+    "--warmup",
+    default=1,
+    show_default=True,
+    type=int,
+    help="Number of untimed warmup iterations before benchmarking.",
+)
+@click.option(
+    "--batch_sizes",
+    default="256,512,1024",
+    show_default=True,
+    help="Comma-separated list of predict batch sizes to sweep.",
+)
+@click.option(
+    "--n_beams_list",
+    default="1",
+    show_default=True,
+    help="Comma-separated list of beam widths to sweep.",
+)
+def benchmark(
+    peak_path: Tuple[str],
+    model: Optional[str],
+    config: Optional[str],
+    output_dir: Optional[str],
+    output_root: Optional[str],
+    verbosity: str,
+    force_overwrite: bool,
+    n_iter: int,
+    warmup: int,
+    batch_sizes: str,
+    n_beams_list: str,
+) -> None:
+    """Benchmark inference throughput across a configuration matrix.
+
+    Sweeps over combinations of batch size and beam width, measuring
+    spectra/second, ms/spectrum, and peak GPU memory. Results are printed
+    as a table to stdout and logged.
+
+    PEAK_PATH must be one or more mzML, mzXML, or MGF files.
+    """
+    import statistics
+    import tempfile
+
+    output_path, output_root_name = _setup_output(
+        output_dir, output_root, force_overwrite, verbosity
+    )
+    utils.log_system_info()
+
+    parsed_batch_sizes = [int(b.strip()) for b in batch_sizes.split(",")]
+    parsed_beams = [int(b.strip()) for b in n_beams_list.split(",")]
+
+    base_config, model_path = setup_model(
+        model, config, output_path, output_root_name, False
+    )
+
+    header = (
+        f"{'batch_size':>12} {'n_beams':>8} {'spectra/s':>12} "
+        f"{'ms/spectrum':>13} {'peak_gpu_mib':>13}"
+    )
+    divider = "-" * len(header)
+    click.echo(header)
+    click.echo(divider)
+
+    for batch_size in parsed_batch_sizes:
+        for n_beams in parsed_beams:
+            cfg = Config.__new__(Config)
+            cfg.__dict__.update(base_config.__dict__)
+            cfg._params = dict(base_config._params)
+            cfg._params["predict_batch_size"] = batch_size
+            cfg._params["n_beams"] = n_beams
+
+            throughputs = []
+            peak_mem_mib = 0
+
+            total_iters = warmup + n_iter
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                with ModelRunner(
+                    cfg, model_path, output_path, None, False
+                ) as runner:
+                    for i in range(total_iters):
+                        is_timed = i >= warmup
+                        if is_timed and torch.cuda.is_available():
+                            torch.cuda.reset_peak_memory_stats()
+
+                        results_path = os.path.join(
+                            tmp_dir, f"bench_{i}.mztab"
+                        )
+                        tput = runner.predict_timed(peak_path, results_path)
+
+                        if is_timed:
+                            throughputs.append(tput)
+                            if torch.cuda.is_available():
+                                peak_mem_mib = max(
+                                    peak_mem_mib,
+                                    torch.cuda.max_memory_allocated() >> 20,
+                                )
+
+            if throughputs:
+                mean_tput = statistics.mean(throughputs)
+                ms_per_spec = (
+                    (1000.0 / mean_tput) if mean_tput > 0 else float("inf")
+                )
+            else:
+                mean_tput, ms_per_spec = 0.0, float("inf")
+
+            row = (
+                f"{batch_size:>12} {n_beams:>8} {mean_tput:>12.1f} "
+                f"{ms_per_spec:>13.2f} {peak_mem_mib:>13}"
+            )
+            click.echo(row)
 
 
 @main.command()
@@ -362,6 +545,42 @@ def configure(
     config_path = str(output_path / config_fname)
     Config.copy_default(config_path)
     logger.info(f"Wrote {config_path}")
+
+
+def _is_valid_model(model: Optional[str], load_all_states: bool) -> None:
+    """
+    Validate the model argument when --load_all_states is specified.
+
+    Parameters
+    ----------
+    model : Optional[str]
+        The model path or URL.
+    load_all_states : bool
+        Whether to load all model states for resuming training.
+
+    Raises
+    ------
+    ValueError
+        If load_all_states is True and model is a URL or non-existent file.
+    UserWarning
+        If load_all_states is True but model is not provided
+    """
+    if load_all_states:
+        if model is None:
+            logger.warning(
+                "When --load_all_states is specified, --model must also be provided. "
+                "Training will start from scratch without a provided model.",
+                stacklevel=2,
+            )
+        elif _is_valid_url(model):
+            raise ValueError(
+                "Full model state cannot be loaded from a URL. "
+                "Please provide a local file path when --load_all_states is True.",
+            )
+        elif not Path(model).is_file():
+            raise ValueError(
+                "When --load_all_states is True, the model path must point to an existing file.",
+            )
 
 
 def setup_logging(
@@ -758,9 +977,12 @@ def _download_weights(file_url: str, download_path: Path) -> None:
         response.raw.read, decode_content=True
     )
 
-    with tqdm.tqdm.wrapattr(
-        response.raw, "read", total=file_size, desc=desc
-    ) as r_raw, open(download_path, "wb") as file:
+    with (
+        tqdm.tqdm.wrapattr(
+            response.raw, "read", total=file_size, desc=desc
+        ) as r_raw,
+        open(download_path, "wb") as file,
+    ):
         shutil.copyfileobj(r_raw, file)
 
 
